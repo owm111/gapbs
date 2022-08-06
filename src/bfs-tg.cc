@@ -2,6 +2,8 @@
 // See LICENSE.txt for license details
 
 #include <oneapi/tbb.h>
+#include <sched.h>
+#include <sys/sysinfo.h>
 #include <iostream>
 #include <vector>
 
@@ -46,6 +48,82 @@ them in parent array as negative numbers. Thus the encoding of parent is:
     November 2012.
 */
 
+class pinning_observer : public oneapi::tbb::task_scheduler_observer {
+	const unsigned shift = 0;
+	const unsigned nprocs;
+	unsigned counter = 0;
+public:
+	pinning_observer(oneapi::tbb::task_arena &a, bool cores_only = false)
+		: oneapi::tbb::task_scheduler_observer(a),
+		shift(cores_only ? 1 : 0), nprocs(get_nprocs())
+	{
+		observe(true);
+	}
+	void on_scheduler_entry(bool worker) override {
+		cpu_set_t *mask = CPU_ALLOC(nprocs);
+		auto mask_size = CPU_ALLOC_SIZE(nprocs);
+		int cpu_number = (counter++ << shift) % nprocs;
+		CPU_ZERO_S(mask_size, mask);
+		CPU_SET_S(cpu_number, mask_size, mask);
+		if (sched_setaffinity(0, mask_size, mask)) {
+			perror("sched_setaffinity");
+			exit(EXIT_FAILURE);
+		}
+		debug("Scheduled a thread on CPU " << cpu_number);
+	}
+	void on_scheduler_exit(bool worker) override {
+		debug("Scheduler exited (worker = " << worker << ")");
+	}
+};
+
+oneapi::tbb::task_arena *arenaptr;
+oneapi::tbb::task_scheduler_observer *observerptr;
+
+void
+init_arenaptr()
+{
+	int default_conc = get_nprocs();
+
+	char *places_a = std::getenv("OMP_PLACES");
+	bool cores_only = false;
+	if (places_a == NULL || places_a[0] == 't') { /* threads */
+		/* leave the default */
+	} else { /* assume cores otherwise */
+		cores_only = true;
+		default_conc >>= 1;
+	}
+
+	char *num_threads_a = std::getenv("OMP_NUM_THREADS");
+	int max_concurrency;
+	if (num_threads_a) {
+		int i = std::atoi(num_threads_a);
+		if (i < 1)
+			i = 1;
+		max_concurrency = i;
+	} else {
+		max_concurrency = default_conc;
+	}
+
+	arenaptr = new oneapi::tbb::task_arena(max_concurrency);
+
+	char *proc_bind_a = std::getenv("OMP_PROC_BIND");
+	if (proc_bind_a && proc_bind_a[0] == 'c') { /* close */
+		debug("Constructed pinning observer");
+		observerptr = new pinning_observer(*arenaptr, cores_only);
+	} else { /* ignore other settings */
+		/* Don't care */
+		debug("default observer");
+		observerptr = new oneapi::tbb::task_scheduler_observer(*arenaptr);
+	}
+}
+
+void
+fini_arenaptr()
+{
+	debug("Calling cleanup code");
+	delete observerptr;
+	delete arenaptr;
+}
 
 using namespace std;
 
@@ -328,6 +406,7 @@ int main(int argc, char* argv[]) {
   CLApp cli(argc, argv, "breadth-first search");
   if (!cli.ParseArgs())
     return -1;
+  init_arenaptr();
   Builder b(cli);
   Graph g = b.MakeGraph();
   SourcePicker<Graph> sp(g, cli.start_vertex());
@@ -336,6 +415,9 @@ int main(int argc, char* argv[]) {
   auto VerifierBound = [&vsp] (const Graph &g, const pvector<NodeID> &parent) {
     return BFSVerifier(g, vsp.PickNext(), parent);
   };
+  arenaptr->execute([&] {
   BenchmarkKernel(cli, g, BFSBound, PrintBFSStats, VerifierBound);
+  });
+  fini_arenaptr();
   return 0;
 }
